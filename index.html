@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GRIDLOCK — Traffic Operations</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;600;700;800;900&family=Overpass+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/style.css">
+</head>
+<body>
+  <div id="app">
+    <canvas id="game"></canvas>
+
+    <header id="topbar">
+      <div class="brand">
+        <div class="brand-sign">
+          <span class="brand-name">GRIDLOCK</span>
+          <span class="brand-sub">TRAFFIC OPERATIONS</span>
+        </div>
+      </div>
+
+      <div class="topgroup" id="map-group">
+        <span class="grouplabel">District</span>
+        <select id="map-select" title="Terrain map">
+          <option value="plains">Open Plains</option>
+          <option value="river">Riverside</option>
+          <option value="lakes">Twin Lakes</option>
+        </select>
+        <button id="btn-clear" class="ghostbtn" title="Bulldoze every road on the map">Clear roads</button>
+      </div>
+
+      <div class="topgroup" id="sim-group">
+        <button id="btn-pause" class="simbtn" title="Pause / resume (Space)">
+          <svg id="ic-pause" viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="2" width="3.6" height="12" rx="1" fill="currentColor"/><rect x="9.4" y="2" width="3.6" height="12" rx="1" fill="currentColor"/></svg>
+          <svg id="ic-play" viewBox="0 0 16 16" width="14" height="14" style="display:none"><path d="M4 2.5v11a1 1 0 0 0 1.5.87l9-5.5a1 1 0 0 0 0-1.74l-9-5.5A1 1 0 0 0 4 2.5z" fill="currentColor"/></svg>
+        </button>
+        <div class="speedset" role="group" aria-label="Simulation speed">
+          <button class="speedbtn active" data-speed="1">1×</button>
+          <button class="speedbtn" data-speed="2">2×</button>
+          <button class="speedbtn" data-speed="4">4×</button>
+        </div>
+        <button id="btn-resetcars" class="ghostbtn" title="Remove all vehicles, keep roads">Reset cars</button>
+        <button id="btn-heat" class="ghostbtn toggle" title="Congestion heatmap overlay">Heatmap</button>
+      </div>
+
+      <div class="statbar">
+        <div class="stat"><span class="stat-label">On road</span><span class="stat-val" id="st-cars">0</span></div>
+        <div class="stat"><span class="stat-label">Arrived</span><span class="stat-val" id="st-arrived">0</span></div>
+        <div class="stat"><span class="stat-label">Flow /min</span><span class="stat-val" id="st-flow">0</span></div>
+        <div class="stat"><span class="stat-label">Avg trip</span><span class="stat-val" id="st-trip">—</span></div>
+        <div class="stat" id="st-grid-wrap" hidden><span class="stat-val warn" id="st-grid">GRIDLOCK</span></div>
+      </div>
+    </header>
+
+    <aside id="toolbar">
+      <div class="toolset" id="tools"></div>
+      <div class="tool-options" id="draw-options" hidden>
+        <div id="placement-opts">
+          <div class="optlabel">Placement</div>
+          <div class="snapset" role="group">
+            <button id="snap-grid" class="snapbtn active" title="Snap to the street grid (G)">Grid</button>
+            <button id="snap-free" class="snapbtn" title="Place freely — still physical, just finer (F)">Free</button>
+            <button id="snap-curve" class="snapbtn" title="Winding curves: click start, click to aim, click to lock — keep clicking to flow (C)">Curve</button>
+          </div>
+        </div>
+        <div class="optlabel">Road type</div>
+        <div id="roadtypes"></div>
+      </div>
+      <div class="toolbar-foot">
+        <div class="dash-rule"></div>
+        <div class="hintline" id="hint">Select a tool</div>
+      </div>
+    </aside>
+
+    <aside id="panel" hidden>
+      <div id="panel-content"></div>
+    </aside>
+
+    <div id="toast" hidden></div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
