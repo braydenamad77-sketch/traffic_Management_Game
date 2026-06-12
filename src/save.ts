@@ -7,7 +7,7 @@ const KEY = 'gridlock-save-v1';
 interface SaveData {
   v: number;
   map: string;
-  nodes: { id: number; x: number; y: number; control: Control; gate: { rate: number; industrial?: boolean } | null }[];
+  nodes: { id: number; x: number; y: number; control: Control; gate: { rate: number; industrial?: boolean } | null; showTurnHelpers?: boolean }[];
   segs: { id: number; a: number; b: number; type: string; spd?: number | null; bans?: string[] }[];
 }
 
@@ -17,6 +17,7 @@ export function save(net: Network, mapId: string) {
     map: mapId,
     nodes: [...net.nodes.values()].map(n => ({
       id: n.id, x: n.pos.x, y: n.pos.y, control: n.control, gate: n.gate,
+      showTurnHelpers: n.showTurnHelpers || undefined,
     })),
     segs: [...net.segs.values()].map(s => ({
       id: s.id, a: s.a, b: s.b, type: s.type,
@@ -43,6 +44,7 @@ export function load(net: Network): string | null {
       const node = net.addNode({ x: n.x, y: n.y }, n.id);
       node.control = n.control ?? { kind: 'open' };
       node.gate = n.gate ?? null;
+      node.showTurnHelpers = !!n.showTurnHelpers;
     }
     for (const s of data.segs) {
       const seg = net.addSegment(s.a, s.b, s.type, s.id);

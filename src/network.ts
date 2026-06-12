@@ -79,6 +79,7 @@ export interface RNode {
   isJunction: boolean; // degree >= 3 (controllable)
   /** the single through-road pair whose markings continue across this junction */
   markThrough: [SegId, SegId] | null;
+  showTurnHelpers: boolean;
 }
 
 export interface Segment {
@@ -133,7 +134,7 @@ export class Network {
       id: nid, pos: { ...pos }, segs: [], control: { kind: 'open' }, gate: null,
       trim: new Map(), markTrim: new Map(), conns: [], connByFrom: new Map(),
       approaches: [], junctionR: 0, isJunction: false,
-      markThrough: null,
+      markThrough: null, showTurnHelpers: false,
     };
     this.nodes.set(nid, n);
     return n;

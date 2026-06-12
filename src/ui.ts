@@ -167,6 +167,10 @@ export class UI {
     const hw = rt.halfWidth * sc;
     c.fillStyle = '#41454d';
     c.fillRect(0, cy - hw, W, hw * 2);
+    if (rt.centerTurn) {
+      c.fillStyle = 'rgba(231,185,60,.12)';
+      c.fillRect(0, cy - (LANE_W * sc) / 2, W, LANE_W * sc);
+    }
     const line = (off: number, color: string, dash: number[] | null, w = 1.2) => {
       c.strokeStyle = color; c.lineWidth = w;
       c.setLineDash(dash ?? []);
@@ -176,10 +180,10 @@ export class UI {
     line(rt.halfWidth - 0.4, '#e8e6df', null);
     line(-(rt.halfWidth - 0.4), '#e8e6df', null);
     if (rt.centerTurn) {
-      line(LANE_W / 2 + 0.2, '#e7b93c', null);
-      line(-(LANE_W / 2 + 0.2), '#e7b93c', null);
-      line(LANE_W / 2 - 0.5, '#e7b93c', [3, 3], 1);
-      line(-(LANE_W / 2 - 0.5), '#e7b93c', [3, 3], 1);
+      line(LANE_W / 2 + 0.48, '#e7b93c', null, 1.35);
+      line(-(LANE_W / 2 + 0.48), '#e7b93c', null, 1.35);
+      line(LANE_W / 2 - 0.28, '#e7b93c', [4, 3], 1.1);
+      line(-(LANE_W / 2 - 0.28), '#e7b93c', [4, 3], 1.1);
     } else if (!rt.oneWay) {
       line(0.5, '#e7b93c', null, 1);
       line(-0.5, '#e7b93c', null, 1);
@@ -416,6 +420,19 @@ export class UI {
       ctrl.appendChild(b);
     }
     body.appendChild(ctrl);
+
+    const helpersRow = document.createElement('label');
+    helpersRow.className = 'fieldrow';
+    helpersRow.innerHTML = `<span>Left-turn helpers</span>`;
+    const helpers = document.createElement('input');
+    helpers.type = 'checkbox';
+    helpers.checked = node.showTurnHelpers;
+    helpers.onchange = () => {
+      node.showTurnHelpers = helpers.checked;
+      this.onChange();
+    };
+    helpersRow.appendChild(helpers);
+    body.appendChild(helpersRow);
 
     if (kind === 'open') {
       body.insertAdjacentHTML('beforeend', `

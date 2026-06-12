@@ -2,12 +2,13 @@
 // junctions, signals/signs, cars, editor overlays.
 
 import { Camera } from './camera';
-import { Network, Segment, RNode, Lane, Chain } from './network';
+import { Network, Segment, RNode, Lane, Turn } from './network';
 import { Sim, Car } from './sim';
 import { Tools } from './tools';
 import { TerrainMap, WORLD_W, WORLD_H, inWater } from './terrain';
 import { LANE_W, roadType } from './roadTypes';
-import { V, Poly, subPoly, offsetPoly, makePoly, polyPoint, polyTangent, projectOnPoly, norm, sub, clamp } from './vec';
+import { buildMarkingPlan, MarkingStroke } from './markings';
+import { V, Poly, subPoly, makePoly, polyPoint, polyTangent, projectOnPoly, norm, sub, clamp } from './vec';
 import { SignalSystem } from './signals';
 
 const COL = {
@@ -43,6 +44,14 @@ interface JGeom {
   coreR: number;
 }
 
+interface StopBarGeom {
+  c: V;
+  d: V;
+  tIn: V;
+  lo: number;
+  hi: number;
+}
+
 const CAR_COLORS = [
   '#c94f43', '#3f6fb5', '#d9d4c8', '#494e57', '#7a9e63',
   '#b08fc4', '#d98e32', '#5fa8a0', '#8a4f3d', '#e3c84f',
@@ -73,10 +82,9 @@ export class Renderer {
     this.cam.apply(ctx, dpr);
     this.drawTerrain(ctx, map);
 
-    // global passes. The invariant that keeps junctions artifact-free:
-    // ALL dark outlines (roads, stubs, fillet curbs) draw in one pass UNDER
-    // all asphalt fills — outlines can only ever show against grass. Then
-    // markings, then mouth covers (plain asphalt) over markings.
+    // global passes. Pavement owns the dark outline/asphalt layers; markings
+    // are planned separately and drawn after junction covers, so they are not
+    // accidentally erased by later asphalt patches.
     for (const seg of net.segs.values()) this.drawBridgeBase(ctx, seg, map);
 
     const jgeoms = new Map<number, JGeom>();
@@ -91,15 +99,18 @@ export class Renderer {
       for (const s of g.stubs) this.strokePoly(ctx, s.pts, s.hw * 2 + 0.9, COL.asphaltEdge, undefined, 'butt');
       for (const f of g.fillets) this.strokeFilletCurb(ctx, f);
     }
-    // pass B: asphalt
+    // pass B: asphalt and junction covers
     for (const ch of net.chains) this.strokePoly(ctx, ch.poly.pts, ch.rt.halfWidth * 2, COL.asphalt);
     for (const g of jgeoms.values()) this.fillJunctionGeom(ctx, g);
-    // pass C: markings
-    for (const ch of net.chains) this.drawChainMarkings(ctx, ch, net);
-    // pass D: mouth covers — plain asphalt over markings inside junctions
-    for (const g of jgeoms.values()) this.fillJunctionGeom(ctx, g);
-    // pass E: corner sweeps — the white edge line follows the pavement
-    // boundary around every junction corner, joining road edge lines
+
+    // pass C: planned markings, plus corner edge sweeps from the same junction
+    // geometry that produced the pavement boundary.
+    const markings = buildMarkingPlan(net);
+    for (const m of markings.laneBands) this.drawMarkingStroke(ctx, m);
+    for (const m of markings.center) this.drawMarkingStroke(ctx, m);
+    for (const m of markings.laneDividers) this.drawMarkingStroke(ctx, m);
+    for (const m of markings.edge) this.drawMarkingStroke(ctx, m);
+
     ctx.strokeStyle = COL.white;
     ctx.lineWidth = 0.26;
     ctx.lineCap = 'round';
@@ -112,6 +123,7 @@ export class Renderer {
       }
     }
 
+    this.drawCenterTurnLaneArrows(ctx, net);
     for (const seg of net.segs.values()) this.drawTurnPockets(ctx, seg, net);
     for (const node of net.nodes.values()) this.drawJunctionDressing(ctx, node, net, sim.signals, time);
 
@@ -121,6 +133,11 @@ export class Renderer {
 
     this.drawOverlays(ctx, net, tools, time);
     this.drawWorldBorder(ctx);
+  }
+
+  private drawMarkingStroke(ctx: CanvasRenderingContext2D, m: MarkingStroke) {
+    const color = m.color === 'white' || m.color === 'yellow' ? COL[m.color] : m.color;
+    this.strokePoly(ctx, m.pts, m.width, color, m.dash, m.cap ?? 'round');
   }
 
   /* ---------------- terrain ---------------- */
@@ -282,7 +299,7 @@ export class Renderer {
     }
 
     // corner fillets between adjacent approaches
-    interface AG { c: V; tIn: V; away: V; hw: number; ang: number; }
+    interface AG { sid: number; c: V; tIn: V; away: V; hw: number; ang: number; }
     const geos: AG[] = [];
     for (const sid of node.segs) {
       const seg = net.segs.get(sid)!;
@@ -295,6 +312,7 @@ export class Renderer {
       const c = polyPoint(ap, s);
       const outward = polyTangent(ap, s);
       geos.push({
+        sid,
         c,
         tIn: { x: -outward.x, y: -outward.y },
         away: norm(sub(c, node.pos)),
@@ -320,7 +338,10 @@ export class Renderer {
         const A = geos[i], B = geos[(i + 1) % geos.length];
         let gap = B.ang - A.ang;
         if (gap <= 0) gap += Math.PI * 2;
-        if (gap > 2.3) continue;          // wide corner: nothing to flare
+        const isThroughPair = !!through &&
+          ((through[0] === A.sid && through[1] === B.sid) ||
+           (through[0] === B.sid && through[1] === A.sid));
+        if (gap > 2.3 && isThroughPair) continue; // the through-side edge stays on the road chain
         const eA = edgePoint(A, B, A.hw);
         const eB = edgePoint(B, A, B.hw);
         const wA = edgePoint(A, B, A.hw - 0.35);
@@ -395,139 +416,25 @@ export class Renderer {
     }
   }
 
-  /** centerline spans along a chain, gapped where a junction allows left
-      turns across it (MUTCD-style: centerlines break across intersections) */
-  private centerSpans(ch: Chain, net: Network, a: number, b: number): [number, number][] {
-    const gaps: [number, number][] = [];
-    let arc = 0;
-    for (let k = 0; k < ch.segs.length - 1; k++) {
-      const s1 = net.segs.get(ch.segs[k])!;
-      const s2 = net.segs.get(ch.segs[k + 1])!;
-      arc += s1.poly.len;
-      const nid = (s1.a === s2.a || s1.a === s2.b) ? s1.a : s1.b;
-      const node = net.nodes.get(nid);
-      if (!node || !node.isJunction) continue;
-      if (!node.conns.some(c => c.turn === 'L')) continue;
-      // gap only the mouth, not the whole taper — real centerline breaks
-      // are about as wide as the crossing road
-      const branchHw = Math.max(...node.segs
-        .filter(sid => sid !== ch.segs[k] && sid !== ch.segs[k + 1])
-        .map(sid => net.segs.get(sid)!.rt.halfWidth), 2);
-      const cap = branchHw * 2 + 5;
-      gaps.push([
-        arc - Math.min(node.markTrim.get(ch.segs[k]) ?? 0, cap) - 0.6,
-        arc + Math.min(node.markTrim.get(ch.segs[k + 1]) ?? 0, cap) + 0.6,
-      ]);
-    }
-    const spans: [number, number][] = [];
-    const end = ch.poly.len - b;
-    let s0 = a;
-    for (const [g0, g1] of gaps) {
-      if (g0 > s0 + 2) spans.push([s0, Math.min(g0, end)]);
-      s0 = Math.max(s0, g1);
-    }
-    if (end > s0 + 2) spans.push([s0, end]);
-    return spans;
-  }
-
-  /** white edge-line spans for one side of a chain (+1 right of travel),
-      ending exactly at junction markTrims and gapped where branches attach
-      on that side — corner sweeps take over from there */
-  private edgeSpans(ch: Chain, net: Network, side: 1 | -1): [number, number][] {
-    const aN = net.nodes.get(ch.aNode)!;
-    const bN = net.nodes.get(ch.bNode)!;
-    const a = aN.markTrim.get(ch.aSeg) ?? aN.trim.get(ch.aSeg) ?? 0;
-    const b = bN.markTrim.get(ch.bSeg) ?? bN.trim.get(ch.bSeg) ?? 0;
-    const end = ch.poly.len - b;
-
-    const gaps: [number, number][] = [];
-    let arc = 0;
-    for (let k = 0; k < ch.segs.length - 1; k++) {
-      const s1 = net.segs.get(ch.segs[k])!;
-      const s2 = net.segs.get(ch.segs[k + 1])!;
-      arc += s1.poly.len;
-      const nid = (s1.a === s2.a || s1.a === s2.b) ? s1.a : s1.b;
-      const node = net.nodes.get(nid);
-      if (!node || !node.isJunction) continue;
-      const T = polyTangent(ch.poly, arc);
-      let branchHere = false;
-      for (const sid of node.segs) {
-        if (sid === ch.segs[k] || sid === ch.segs[k + 1]) continue;
-        const seg = net.segs.get(sid)!;
-        const other = net.nodes.get(seg.a === nid ? seg.b : seg.a)!;
-        const d = norm(sub(other.pos, node.pos));
-        const cr = T.x * d.y - T.y * d.x;     // > 0: branch on the right
-        if ((cr > 0 ? 1 : -1) === side) { branchHere = true; break; }
-      }
-      if (!branchHere) continue;
-      gaps.push([
-        arc - (node.markTrim.get(ch.segs[k]) ?? 0),
-        arc + (node.markTrim.get(ch.segs[k + 1]) ?? 0),
-      ]);
-    }
-
-    gaps.sort((x, y) => x[0] - y[0]);
-    const spans: [number, number][] = [];
-    let s0 = a;
-    for (const [g0, g1] of gaps) {
-      if (g0 > s0 + 1) spans.push([s0, Math.min(g0, end)]);
-      s0 = Math.max(s0, g1);
-    }
-    if (end > s0 + 1) spans.push([s0, end]);
-    return spans;
-  }
-
-  private drawChainMarkings(ctx: CanvasRenderingContext2D, ch: Chain, net: Network) {
-    const aN = net.nodes.get(ch.aNode)!;
-    const bN = net.nodes.get(ch.bNode)!;
-    const aT = (aN.markTrim.get(ch.aSeg) ?? aN.trim.get(ch.aSeg) ?? 0) + (aN.segs.length >= 3 ? 0.6 : 0.1);
-    const bT = (bN.markTrim.get(ch.bSeg) ?? bN.trim.get(ch.bSeg) ?? 0) + (bN.segs.length >= 3 ? 0.6 : 0.1);
-    if (ch.poly.len - aT - bT < 3) return;
-    const span = subPoly(ch.poly, aT, ch.poly.len - bT);
-    const rt = ch.rt;
-    const hw = rt.halfWidth;
-
-    // edge lines: per side, gapped at branch mouths, exact trim ends
-    for (const side of [1, -1] as const) {
-      for (const [e0, e1] of this.edgeSpans(ch, net, side)) {
-        const es = subPoly(ch.poly, e0, e1);
-        if (es.len < 0.8) continue;
-        this.strokePoly(ctx, offsetPoly(es, side * (hw - 0.35)), 0.26, COL.white);
-      }
-    }
-
-    // center markings, gapped across left-turn junctions
-    if (rt.centerTurn || !rt.oneWay) {
-      for (const [c0, c1] of this.centerSpans(ch, net, aT, bT)) {
-        const cs = subPoly(ch.poly, c0, c1);
-        if (cs.len < 2) continue;
-        if (rt.centerTurn) {
-          const o = LANE_W / 2;
-          this.strokePoly(ctx, offsetPoly(cs, o + 0.18), 0.24, COL.yellow);
-          this.strokePoly(ctx, offsetPoly(cs, -(o + 0.18)), 0.24, COL.yellow);
-          this.strokePoly(ctx, offsetPoly(cs, o - 0.32), 0.22, COL.yellow, [2.6, 2.6]);
-          this.strokePoly(ctx, offsetPoly(cs, -(o - 0.32)), 0.22, COL.yellow, [2.6, 2.6]);
-        } else {
-          this.strokePoly(ctx, offsetPoly(cs, 0.24), 0.24, COL.yellow);
-          this.strokePoly(ctx, offsetPoly(cs, -0.24), 0.24, COL.yellow);
+  /** center turn-lane arrows — drawn above junction discs */
+  private drawCenterTurnLaneArrows(ctx: CanvasRenderingContext2D, net: Network) {
+    if (this.cam.zoom <= 1.05) return;
+    for (const ch of net.chains) {
+      if (!ch.rt.centerTurn || ch.poly.len < 30) continue;
+      const step = 34;
+      for (let s = 14; s < ch.poly.len - 12; s += step) {
+        const p = polyPoint(ch.poly, s);
+        const t = polyTangent(ch.poly, s);
+        this.drawLaneUseGlyphAt(ctx, p, t, ['L']);
+        if (s + step * 0.45 < ch.poly.len - 12) {
+          const q = polyPoint(ch.poly, s + step * 0.45);
+          const u = polyTangent(ch.poly, s + step * 0.45);
+          this.drawLaneUseGlyphAt(ctx, q, { x: -u.x, y: -u.y }, ['L']);
         }
       }
     }
-
-    // dashed dividers between same-direction lanes
-    for (const dir of [1, -1] as const) {
-      const offs = rt.lanes
-        .filter(l => l.dir === dir && l.kind === 'drive')
-        .map(l => l.off)
-        .sort((a, b) => a - b);
-      for (let i = 1; i < offs.length; i++) {
-        const mid = (offs[i - 1] + offs[i]) / 2;
-        this.strokePoly(ctx, offsetPoly(span, mid), 0.2, COL.white, [3, 3.2]);
-      }
-    }
   }
 
-  /** center turn-lane arrows — drawn above junction discs */
   private drawTurnPockets(ctx: CanvasRenderingContext2D, seg: Segment, net: Network) {
     if (!seg.rt.centerTurn || this.cam.zoom <= 1.6) return;
     for (const lane of seg.lanes) {
@@ -538,47 +445,121 @@ export class Renderer {
     }
   }
 
-  private drawTurnGlyph(ctx: CanvasRenderingContext2D, lane: Lane, turn: 'L' | 'R' | 'S') {
-    const s = Math.max(2, lane.poly.len - 7);
+  private drawTurnGlyph(ctx: CanvasRenderingContext2D, lane: Lane, turn: Turn) {
+    this.drawLaneUseGlyph(ctx, lane, [turn]);
+  }
+
+  private arrowHead(ctx: CanvasRenderingContext2D, x: number, y: number, angle: number, size = 0.44) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    ctx.moveTo(size, 0);
+    ctx.lineTo(-size * 0.45, -size * 0.58);
+    ctx.lineTo(-size * 0.24, 0);
+    ctx.lineTo(-size * 0.45, size * 0.58);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  private drawLaneUseGlyph(ctx: CanvasRenderingContext2D, lane: Lane, turns: Turn[]) {
+    if (!turns.length || lane.poly.len < 8) return;
+    const s = Math.max(2, lane.poly.len - 4.2);
     const p = polyPoint(lane.poly, s);
     const t = polyTangent(lane.poly, s);
+    this.drawLaneUseGlyphAt(ctx, p, t, turns);
+  }
+
+  private drawLaneUseGlyphAt(ctx: CanvasRenderingContext2D, p: V, heading: V, turns: Turn[]) {
+    if (!turns.length) return;
+    const unique = new Set(turns);
+
     ctx.save();
     ctx.translate(p.x, p.y);
-    ctx.rotate(Math.atan2(t.y, t.x));
-    ctx.strokeStyle = COL.white;
-    ctx.lineWidth = 0.45;
+    ctx.rotate(Math.atan2(heading.y, heading.x));
+    ctx.strokeStyle = 'rgba(232,230,223,.92)';
+    ctx.fillStyle = 'rgba(232,230,223,.92)';
+    ctx.lineWidth = 0.26;
     ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
     ctx.beginPath();
-    ctx.moveTo(-1.8, 0);
-    ctx.lineTo(0.6, 0);
-    if (turn === 'L') { ctx.quadraticCurveTo(1.6, 0, 1.6, -1.1); }
-    else if (turn === 'R') { ctx.quadraticCurveTo(1.6, 0, 1.6, 1.1); }
-    else ctx.lineTo(2, 0);
-    ctx.stroke();
-    // arrowhead
-    const hx = turn === 'S' ? 2 : 1.6;
-    const hy = turn === 'L' ? -1.1 : turn === 'R' ? 1.1 : 0;
-    ctx.fillStyle = COL.white;
-    ctx.beginPath();
-    if (turn === 'S') {
-      ctx.moveTo(hx + 0.9, 0); ctx.lineTo(hx - 0.3, -0.7); ctx.lineTo(hx - 0.3, 0.7);
-    } else {
-      const dy = turn === 'L' ? -0.9 : 0.9;
-      ctx.moveTo(hx, hy + dy); ctx.lineTo(hx - 0.7, hy - dy * 0.2); ctx.lineTo(hx + 0.7, hy - dy * 0.2);
+    ctx.moveTo(-1.25, 0);
+    ctx.lineTo(0.18, 0);
+    if (unique.has('S')) {
+      ctx.moveTo(0.14, 0);
+      ctx.lineTo(1.35, 0);
     }
-    ctx.closePath(); ctx.fill();
+    if (unique.has('L')) {
+      ctx.moveTo(0.03, 0);
+      ctx.quadraticCurveTo(0.7, -0.03, 0.76, -0.58);
+    }
+    if (unique.has('R')) {
+      ctx.moveTo(0.03, 0);
+      ctx.quadraticCurveTo(0.7, 0.03, 0.76, 0.58);
+    }
+    ctx.stroke();
+
+    if (unique.has('S')) this.arrowHead(ctx, 1.35, 0, 0);
+    if (unique.has('L')) this.arrowHead(ctx, 0.76, -0.58, -Math.PI / 2);
+    if (unique.has('R')) this.arrowHead(ctx, 0.76, 0.58, Math.PI / 2);
     ctx.restore();
   }
 
   /* ---------------- junction dressing: stop lines, signals, signs ---------------- */
 
+  private stopBarGeom(node: RNode, net: Network, ap: RNode['approaches'][number]): StopBarGeom | null {
+    const lanes = ap.inLanes;
+    if (!lanes.length) return null;
+    const seg = net.segs.get(ap.seg);
+    if (!seg) return null;
+
+    const markTrim = node.markTrim.get(ap.seg) ?? node.trim.get(ap.seg) ?? 0;
+    const approach = net.approachPoly(node.id, ap.seg, Math.max(10, markTrim + 4));
+    if (!approach || approach.len < 1) return null;
+
+    // approachPoly walks outward from the junction. The stop bar belongs just
+    // outside the measured mouth, not at the capped vehicle connector endpoint.
+    const s = clamp(markTrim + 0.75, 0.8, Math.max(0.8, approach.len - 0.3));
+    const c = polyPoint(approach, s);
+    const tOut = polyTangent(approach, s);
+    const tIn = { x: -tOut.x, y: -tOut.y };
+    const d = { x: -tIn.y, y: tIn.x };
+
+    const roadLo = -seg.rt.halfWidth + 0.38;
+    const roadHi = seg.rt.halfWidth - 0.38;
+    const laneLo = Math.min(...lanes.map(l => l.offTravel - LANE_W / 2));
+    const laneHi = Math.max(...lanes.map(l => l.offTravel + LANE_W / 2));
+    let lo = Math.max(roadLo, laneLo);
+    let hi = Math.min(roadHi, laneHi);
+
+    if (seg.rt.oneWay) {
+      lo = roadLo;
+      hi = roadHi;
+    } else if ((laneLo + laneHi) / 2 >= 0) {
+      lo = Math.max(roadLo, Math.min(0, laneLo));
+      hi = roadHi;
+    } else {
+      lo = roadLo;
+      hi = Math.min(roadHi, Math.max(0, laneHi));
+    }
+    if (hi - lo < 1) {
+      const mid = (lo + hi) / 2;
+      lo = Math.max(roadLo, mid - 0.5);
+      hi = Math.min(roadHi, mid + 0.5);
+    }
+
+    return { c, d, tIn, lo, hi };
+  }
+
   private drawJunctionDressing(ctx: CanvasRenderingContext2D, node: RNode, net: Network, signals: SignalSystem, time: number) {
     if (!node.isJunction) return;
+    const kind = node.control.kind;
     const isLights = node.control.kind === 'lights';
     const through = node.markThrough;
 
     // left-turn guide lines: the AI's actual turning paths, made visible
-    if (isLights || !through) {
+    if (node.showTurnHelpers || isLights || !through) {
       ctx.strokeStyle = 'rgba(232,230,223,.5)';
       ctx.lineWidth = 0.18;
       ctx.setLineDash([1.2, 2.2]);
@@ -596,10 +577,9 @@ export class Renderer {
     for (const ap of node.approaches) {
       const lanes = ap.inLanes;
       if (!lanes.length) continue;
-      const lo = Math.min(...lanes.map(l => l.offTravel)) - LANE_W / 2 + 0.3;
-      const hi = Math.max(...lanes.map(l => l.offTravel)) + LANE_W / 2 - 0.3;
-      const c = ap.stopPos;
-      const d = ap.stopDir;
+      const stop = this.stopBarGeom(node, net, ap);
+      if (!stop) continue;
+      const { c, d, lo, hi } = stop;
       const sign = net.signFor(node, ap.seg);
       const isThroughAp = !!through && (ap.seg === through[0] || ap.seg === through[1]);
 
@@ -609,6 +589,7 @@ export class Renderer {
       const bar = (width: number, dash?: number[]) => {
         ctx.strokeStyle = COL.white;
         ctx.lineWidth = width;
+        ctx.lineCap = 'butt';
         if (dash) ctx.setLineDash(dash);
         ctx.beginPath();
         ctx.moveTo(c.x + d.x * lo, c.y + d.y * lo);
@@ -618,57 +599,58 @@ export class Renderer {
       };
       if (isLights || sign === 'stop' || sign === 'blinkR') bar(0.7);
       else if (sign === 'yield' || sign === 'blinkY') bar(0.55, [1.1, 1.1]);
+      else if (kind === 'open') bar(0.5);
       else if (!isThroughAp) bar(0.5);
 
       // crosswalk at signalized approaches, just beyond the stop bar
-      if (isLights) this.drawCrosswalk(ctx, node, net, ap.seg);
+      if (isLights) this.drawCrosswalk(ctx, stop);
 
-      // lane turn glyphs at signal/sign-controlled approaches
-      if (this.cam.zoom > 2.1 && (isLights || node.control.kind === 'signs')) {
+      // lane-use arrows come from actual lane connectors, so they follow every
+      // generated intersection shape and road type.
+      if (this.cam.zoom > 1.35) {
         for (const lane of lanes) {
-          const turns = new Set(net.connsFrom(lane.id).map(cc => cc.turn));
-          if (turns.size === 1) this.drawTurnGlyph(ctx, lane, [...turns][0]);
+          const present = new Set(net.connsFrom(lane.id).map(cc => cc.turn));
+          const turns = (['L', 'S', 'R'] as Turn[]).filter(t => present.has(t));
+          const lateral = clamp(lane.offTravel, lo + 0.7, hi - 0.7);
+          const arrowPos = {
+            x: c.x + d.x * lateral - stop.tIn.x * 3.35,
+            y: c.y + d.y * lateral - stop.tIn.y * 3.35,
+          };
+          this.drawLaneUseGlyphAt(ctx, arrowPos, stop.tIn, turns);
         }
       }
 
       // signal head / sign icon at right corner of the approach
+      const shoulder = {
+        x: c.x + d.x * (hi + 0.35),
+        y: c.y + d.y * (hi + 0.35),
+      };
       const iconPos = {
-        x: c.x + d.x * (hi + 1.6),
-        y: c.y + d.y * (hi + 1.6),
+        x: c.x + d.x * (hi + 2.15) - stop.tIn.x * 0.2,
+        y: c.y + d.y * (hi + 2.15) - stop.tIn.y * 0.2,
       };
       if (isLights) {
         const light = signals.lightForApproach(node, ap.seg);
-        ctx.fillStyle = '#22252b';
-        ctx.beginPath(); ctx.arc(iconPos.x, iconPos.y, 1.45, 0, 7); ctx.fill();
-        ctx.fillStyle = light === 'green' ? '#3fd06a' : light === 'yellow' ? '#ffc233' : '#ff5043';
-        ctx.beginPath(); ctx.arc(iconPos.x, iconPos.y, 0.85, 0, 7); ctx.fill();
-        ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 0.18;
-        ctx.stroke();
+        this.drawSignalIcon(ctx, shoulder, iconPos, light);
       } else if (sign !== 'none') {
-        this.drawSignIcon(ctx, iconPos, sign, time);
+        this.drawSignIcon(ctx, shoulder, iconPos, sign, time);
       }
     }
   }
 
   /** continental crosswalk bars across the full road width, junction-side
       of the stop bar */
-  private drawCrosswalk(ctx: CanvasRenderingContext2D, node: RNode, net: Network, segId: number) {
-    const seg = net.segs.get(segId);
-    if (!seg) return;
-    const trim = node.trim.get(segId) ?? 0;
-    if (trim < 2 || seg.poly.len < trim + 2) return;
-    const atA = seg.a === node.id;
-    // band center sits 1.7 units junction-side of the lane trim
-    const arc = atA ? Math.max(0.5, trim - 1.7) : Math.min(seg.poly.len - 0.5, seg.poly.len - trim + 1.7);
-    const p = polyPoint(seg.poly, arc);
-    let t = polyTangent(seg.poly, arc);
-    if (!atA) t = { x: -t.x, y: -t.y };       // toward the junction
-    const n = { x: -t.y, y: t.x };
-    const hw = seg.rt.halfWidth - 0.7;
+  private drawCrosswalk(ctx: CanvasRenderingContext2D, stop: StopBarGeom) {
+    const p = {
+      x: stop.c.x + stop.tIn.x * 1.7,
+      y: stop.c.y + stop.tIn.y * 1.7,
+    };
+    const t = stop.tIn;
+    const n = stop.d;
     ctx.strokeStyle = 'rgba(232,230,223,.85)';
     ctx.lineWidth = 0.62;
     ctx.lineCap = 'butt';
-    for (let off = -hw + 0.5; off <= hw - 0.4; off += 1.18) {
+    for (let off = stop.lo + 0.5; off <= stop.hi - 0.4; off += 1.18) {
       ctx.beginPath();
       ctx.moveTo(p.x + n.x * off - t.x * 0.8, p.y + n.y * off - t.y * 0.8);
       ctx.lineTo(p.x + n.x * off + t.x * 0.8, p.y + n.y * off + t.y * 0.8);
@@ -676,25 +658,89 @@ export class Renderer {
     }
   }
 
-  private drawSignIcon(ctx: CanvasRenderingContext2D, p: V, sign: string, time: number) {
-    const blinkOn = (time * 1.4) % 1 < 0.55;
+  private drawControlPost(ctx: CanvasRenderingContext2D, shoulder: V, p: V) {
+    ctx.strokeStyle = 'rgba(28,32,40,.72)';
+    ctx.lineWidth = 0.18;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(shoulder.x, shoulder.y);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(28,32,40,.75)';
+    ctx.beginPath();
+    ctx.arc(shoulder.x, shoulder.y, 0.18, 0, 7);
+    ctx.fill();
+  }
+
+  private drawSignalIcon(ctx: CanvasRenderingContext2D, shoulder: V, p: V, light: string) {
+    this.drawControlPost(ctx, shoulder, p);
     ctx.save();
     ctx.translate(p.x, p.y);
+    ctx.fillStyle = 'rgba(0,0,0,.22)';
+    this.rrect(ctx, -0.95 + 0.18, -1.55 + 0.2, 1.9, 3.1, 0.35);
+    ctx.fill();
+    ctx.fillStyle = '#22252b';
+    this.rrect(ctx, -0.95, -1.55, 1.9, 3.1, 0.35);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.22)';
+    ctx.lineWidth = 0.12;
+    ctx.stroke();
+    const lamps: [string, string, number][] = [
+      ['red', '#ff5043', -0.85],
+      ['yellow', '#ffc233', 0],
+      ['green', '#3fd06a', 0.85],
+    ];
+    for (const [kind, color, y] of lamps) {
+      ctx.fillStyle = kind === light ? color : 'rgba(130,138,150,.32)';
+      ctx.beginPath();
+      ctx.arc(0, y, 0.38, 0, 7);
+      ctx.fill();
+      if (kind === light) {
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 4;
+        ctx.beginPath();
+        ctx.arc(0, y, 0.38, 0, 7);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    }
+    ctx.restore();
+  }
+
+  private drawSignIcon(ctx: CanvasRenderingContext2D, shoulder: V, p: V, sign: string, time: number) {
+    const blinkOn = (time * 1.4) % 1 < 0.55;
+    this.drawControlPost(ctx, shoulder, p);
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.fillStyle = 'rgba(0,0,0,.22)';
+    ctx.beginPath();
     if (sign === 'stop') {
+      ctx.save(); ctx.translate(0.16, 0.18); this.octagon(ctx, 1.28); ctx.fill(); ctx.restore();
       ctx.fillStyle = '#cf3d3d';
-      this.octagon(ctx, 1.35); ctx.fill();
-      ctx.strokeStyle = '#fff'; ctx.lineWidth = 0.22;
-      this.octagon(ctx, 1.05); ctx.stroke();
-    } else if (sign === 'yield') {
+      this.octagon(ctx, 1.28); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 0.18;
+      this.octagon(ctx, 1.04); ctx.stroke();
       ctx.fillStyle = '#fff';
-      this.triangle(ctx, 1.5); ctx.fill();
+      ctx.font = '700 0.48px Overpass, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('STOP', 0, 0.03);
+    } else if (sign === 'yield') {
+      ctx.save(); ctx.translate(0.16, 0.18); this.triangle(ctx, 1.42); ctx.fill(); ctx.restore();
+      ctx.fillStyle = '#fff';
+      this.triangle(ctx, 1.42); ctx.fill();
       ctx.fillStyle = '#cf3d3d';
-      this.triangle(ctx, 1.1); ctx.fill();
+      this.triangle(ctx, 1.08); ctx.fill();
       ctx.fillStyle = '#fff';
       this.triangle(ctx, 0.55); ctx.fill();
     } else if (sign === 'blinkY' || sign === 'blinkR') {
+      ctx.save(); ctx.translate(0.14, 0.16); this.rrect(ctx, -0.95, -0.95, 1.9, 1.9, 0.35); ctx.fill(); ctx.restore();
       ctx.fillStyle = '#22252b';
-      ctx.beginPath(); ctx.arc(0, 0, 1.3, 0, 7); ctx.fill();
+      this.rrect(ctx, -0.95, -0.95, 1.9, 1.9, 0.35);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,.2)';
+      ctx.lineWidth = 0.12;
+      ctx.stroke();
       if (blinkOn) {
         ctx.fillStyle = sign === 'blinkY' ? '#ffc233' : '#ff5043';
         ctx.beginPath(); ctx.arc(0, 0, 0.8, 0, 7); ctx.fill();
