@@ -127,6 +127,17 @@ export class Network {
 
   /* ---------------- topology ops ---------------- */
 
+  clear() {
+    this.nodes.clear();
+    this.segs.clear();
+    this.lanesById.clear();
+    this.connsById.clear();
+    this.chains = [];
+    this.nextNode = 1;
+    this.nextSeg = 1;
+    this.version++;
+  }
+
   addNode(pos: V, id?: NodeId): RNode {
     const nid = id ?? this.nextNode++;
     if (id !== undefined) this.nextNode = Math.max(this.nextNode, id + 1);

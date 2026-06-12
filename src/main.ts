@@ -8,6 +8,10 @@ import { Renderer } from './render';
 import { UI } from './ui';
 import { getMap, MAPS } from './terrain';
 import { save, load } from './save';
+import { exportNetwork, importNetwork } from './levelData';
+import { buildLevel, LevelDefinition, levelBounds } from './levelKit';
+import { createObjectiveRun, ObjectiveRun, resetObjectiveRun, updateObjectiveRun } from './objective';
+import { CAMPAIGN_LEVELS, findLevel } from '../levels';
 
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 
@@ -19,8 +23,13 @@ const renderer = new Renderer(canvas, cam);
 let mapId = 'plains';
 let heatmap = false;
 let saveDirty = false;
+let playMode: 'custom' | 'campaign' = 'custom';
+let activeLevel: LevelDefinition | null = null;
+let objectiveRun: ObjectiveRun = createObjectiveRun(null);
 
-const markDirty = () => { saveDirty = true; };
+const markDirty = () => {
+  if (playMode === 'custom') saveDirty = true;
+};
 
 const tools = new Tools(
   net,
@@ -31,13 +40,17 @@ const tools = new Tools(
 
 const ui = new UI(net, sim, tools, markDirty);
 
-// restore previous session
-const loadedMap = load(net);
-if (loadedMap) {
-  mapId = loadedMap;
-  (document.getElementById('map-select') as HTMLSelectElement).value = mapId;
-}
-net.rebuild();
+const mapSelect = document.getElementById('map-select') as HTMLSelectElement;
+const levelSelect = document.getElementById('level-select') as HTMLSelectElement;
+const objectiveCard = document.getElementById('objective-card')!;
+const objectiveKicker = document.getElementById('objective-kicker')!;
+const objectiveTitle = document.getElementById('objective-title')!;
+const objectiveSubtitle = document.getElementById('objective-subtitle')!;
+const objectiveArrivals = document.getElementById('objective-arrivals')!;
+const objectiveStatus = document.getElementById('objective-status')!;
+
+setupLevelPicker();
+loadCustomSandbox();
 
 /* ---------------- input ---------------- */
 
@@ -176,7 +189,11 @@ document.querySelectorAll<HTMLButtonElement>('.speedbtn').forEach(b => {
   b.onclick = () => setSpeed(+b.dataset.speed!);
 });
 
-document.getElementById('btn-resetcars')!.onclick = () => sim.resetCars();
+document.getElementById('btn-resetcars')!.onclick = () => {
+  sim.resetRun();
+  objectiveRun = resetObjectiveRun(objectiveRun, sim.arrived);
+  renderObjectiveUI(sim.stats());
+};
 
 const heatBtn = document.getElementById('btn-heat')!;
 heatBtn.onclick = () => {
@@ -184,7 +201,7 @@ heatBtn.onclick = () => {
   heatBtn.classList.toggle('on', heatmap);
 };
 
-(document.getElementById('map-select') as HTMLSelectElement).onchange = e => {
+mapSelect.onchange = e => {
   mapId = (e.target as HTMLSelectElement).value;
   markDirty();
 };
@@ -193,15 +210,16 @@ document.getElementById('btn-clear')!.onclick = () => {
   if (!confirm('Demolish every road on the map?')) return;
   for (const sid of [...net.segs.keys()]) net.removeSegment(sid);
   net.rebuild();
-  sim.resetCars();
+  sim.resetRun();
+  objectiveRun = resetObjectiveRun(objectiveRun, sim.arrived);
+  renderObjectiveUI(sim.stats());
   tools.select(null);
   markDirty();
 };
 
 /* ---------------- starter road (first run only) ---------------- */
 
-if (net.segs.size === 0 && !localStorage.getItem('gridlock-save-v1')) {
-  // a small two-way road with gates at both ends so the screen isn't empty
+function seedStarterRoad() {
   const a = net.addNode({ x: 160, y: 200 });
   const m = net.addNode({ x: 320, y: 192 });
   const b = net.addNode({ x: 480, y: 200 });
@@ -210,6 +228,120 @@ if (net.segs.size === 0 && !localStorage.getItem('gridlock-save-v1')) {
   a.gate = { rate: 10 };
   b.gate = { rate: 10 };
   net.rebuild();
+}
+
+function setupLevelPicker() {
+  for (const level of CAMPAIGN_LEVELS) {
+    const opt = document.createElement('option');
+    opt.value = level.id;
+    opt.textContent = `${level.campaign!.difficulty}. ${level.campaign!.title}`;
+    levelSelect.appendChild(opt);
+  }
+
+  levelSelect.onchange = () => {
+    const id = levelSelect.value;
+    if (id === (activeLevel?.id ?? 'custom')) return;
+    if (id === 'custom') {
+      if (!confirm('Load the Custom Sandbox? This replaces the current city.')) {
+        syncLevelSelect();
+        return;
+      }
+      loadCustomSandbox();
+      return;
+    }
+
+    const level = findLevel(id);
+    if (!level) {
+      syncLevelSelect();
+      return;
+    }
+    if (!confirm(`Load ${level.name}? This replaces the current city.`)) {
+      syncLevelSelect();
+      return;
+    }
+    loadCampaignLevel(level);
+  };
+}
+
+function syncLevelSelect() {
+  levelSelect.value = activeLevel?.id ?? 'custom';
+}
+
+function loadCustomSandbox() {
+  playMode = 'custom';
+  activeLevel = null;
+  net.clear();
+  const loadedMap = load(net);
+  if (loadedMap) {
+    mapId = loadedMap;
+  } else {
+    mapId = 'plains';
+    seedStarterRoad();
+  }
+  mapSelect.value = mapId;
+  syncLevelSelect();
+  tools.select(null);
+  sim.resetRun();
+  objectiveRun = createObjectiveRun(null, sim.arrived);
+  renderObjectiveUI(sim.stats());
+  saveDirty = false;
+}
+
+function loadCampaignLevel(level: LevelDefinition) {
+  const built = buildLevel(level);
+  mapId = importNetwork(net, exportNetwork(built.net, built.map));
+  mapSelect.value = mapId;
+  playMode = 'campaign';
+  activeLevel = level;
+  syncLevelSelect();
+  tools.select(null);
+  sim.resetRun();
+  objectiveRun = createObjectiveRun(level, sim.arrived);
+  moveCameraToLevel(level);
+  renderObjectiveUI(sim.stats());
+  saveDirty = false;
+}
+
+function moveCameraToLevel(level: LevelDefinition) {
+  const shot = buildLevel(level).shots.overview;
+  if (shot) {
+    cam.x = shot.center[0];
+    cam.y = shot.center[1];
+    cam.zoom = shot.zoom;
+    return;
+  }
+  const bounds = levelBounds(net);
+  cam.x = bounds.center[0];
+  cam.y = bounds.center[1];
+  cam.zoom = Math.max(1.8, Math.min(2.8, 820 / Math.max(bounds.size[0], bounds.size[1])));
+}
+
+function renderObjectiveUI(stats: ReturnType<Sim['stats']>) {
+  if (!objectiveRun.objective || !objectiveRun.level?.campaign) {
+    objectiveCard.hidden = true;
+    return;
+  }
+
+  objectiveCard.hidden = false;
+  objectiveCard.classList.toggle('won', objectiveRun.status === 'won');
+  objectiveCard.classList.toggle('failed', objectiveRun.status === 'failed');
+  objectiveKicker.textContent = `Level ${objectiveRun.level.campaign.difficulty}`;
+  objectiveTitle.textContent = objectiveRun.level.campaign.title;
+  objectiveSubtitle.textContent = objectiveRun.level.campaign.subtitle;
+  objectiveArrivals.textContent = `Arrived ${objectiveRun.progress} / ${objectiveRun.objective.targetArrivals}`;
+  objectiveStatus.textContent = objectiveRun.status === 'won'
+    ? 'Cleared'
+    : objectiveRun.status === 'failed' ? 'Gridlock' : stats.gridlocked ? 'Gridlock' : 'Running';
+}
+
+function updateObjective(stats: ReturnType<Sim['stats']>) {
+  const before = objectiveRun.status;
+  objectiveRun = updateObjectiveRun(objectiveRun, stats);
+  if (before !== objectiveRun.status) {
+    if (objectiveRun.status === 'won') ui.toast('Level cleared');
+    if (objectiveRun.status === 'failed') ui.toast('Gridlock hit the city');
+  }
+  renderObjectiveUI(stats);
 }
 
 /* ---------------- game loop ---------------- */
@@ -248,12 +380,14 @@ function frame(now: number) {
   statTimer += elapsed;
   if (statTimer > 0.4) {
     statTimer = 0;
-    ui.updateStats(sim.stats());
+    const stats = sim.stats();
+    ui.updateStats(stats);
+    updateObjective(stats);
     ui.tick();
   }
 
   saveTimer += elapsed;
-  if (saveDirty && saveTimer > 2) {
+  if (playMode === 'custom' && saveDirty && saveTimer > 2) {
     saveTimer = 0;
     saveDirty = false;
     save(net, mapId);
@@ -264,4 +398,4 @@ function frame(now: number) {
 requestAnimationFrame(frame);
 
 // expose for curious consoles
-(window as any).game = { net, sim, tools, cam, MAPS };
+(window as any).game = { net, sim, tools, cam, MAPS, CAMPAIGN_LEVELS };

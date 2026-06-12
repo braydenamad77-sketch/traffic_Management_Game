@@ -7,6 +7,7 @@ import { VehicleKind } from './roadTypes';
 import { Router, RouteStep } from './router';
 import { SignalSystem, hasPriority } from './signals';
 import { V, polyPoint, polyTangent, clamp } from './vec';
+import { MathRng, Rng } from './rng';
 
 /* ---------------- tuning ---------------- */
 
@@ -72,15 +73,15 @@ export class Car {
   pos: V = { x: 0, y: 0 };
   hdg: V = { x: 1, y: 0 };
 
-  constructor(goal: number, now: number, kind: VehicleKind = 'sedan') {
+  constructor(goal: number, now: number, kind: VehicleKind = 'sedan', rng: Rng = new MathRng()) {
     this.goal = goal;
     this.kind = kind;
     this.spec = VEHICLES[kind];
     this.len = this.spec.len;
     this.width = this.spec.width;
-    this.colorIdx = Math.floor(Math.random() * 10);
+    this.colorIdx = Math.floor(rng.next() * 10);
     this.spawnTime = now;
-    this.rerouteIn = REROUTE_EVERY * (0.7 + Math.random() * 0.6);
+    this.rerouteIn = REROUTE_EVERY * (0.7 + rng.next() * 0.6);
   }
 
   cur(): PathPiece | undefined { return this.pieces[this.pi]; }
@@ -112,7 +113,7 @@ export class Sim {
   private tickets = new Map<number, number>();
   private netVersion = -1;
 
-  constructor(public net: Network) {
+  constructor(public net: Network, private rng: Rng = new MathRng()) {
     this.signals = new SignalSystem(net);
     this.router = new Router(net, id => this.occEMA.get(id) ?? 0);
   }
@@ -137,6 +138,18 @@ export class Sim {
     this.cars = [];
     this.occupants.clear();
     this.arrivals = [];
+  }
+
+  resetRun() {
+    this.resetCars();
+    this.occEMA.clear();
+    this.gateCooldown.clear();
+    this.tickets.clear();
+    this.time = 0;
+    this.arrived = 0;
+    this.netVersion = -1;
+    this.signals = new SignalSystem(this.net);
+    this.router = new Router(this.net, id => this.occEMA.get(id) ?? 0);
   }
 
   onNetworkChange() {
@@ -232,7 +245,7 @@ export class Sim {
 
   private pickGoal(excludeNode: number): number {
     const gates = this.net.gates().filter(g => g.id !== excludeNode);
-    return gates.length ? gates[Math.floor(Math.random() * gates.length)].id : -1;
+    return gates.length ? gates[Math.floor(this.rng.next() * gates.length)].id : -1;
   }
 
   private spawn(dt: number) {
@@ -241,7 +254,7 @@ export class Sim {
       if (rate <= 0) continue;
       let cd = (this.gateCooldown.get(gate.id) ?? 0) - dt;
       if (cd <= 0) {
-        cd = (60 / rate) * (0.65 + Math.random() * 0.7);
+        cd = (60 / rate) * (0.65 + this.rng.next() * 0.7);
         this.trySpawnAt(gate);
       }
       this.gateCooldown.set(gate.id, cd);
@@ -258,7 +271,7 @@ export class Sim {
     const goal = this.pickGoal(gate.id);
     if (goal < 0) return;
     // vehicle mix: industrial gates dispatch semis, normal gates city traffic
-    const roll = Math.random();
+    const roll = this.rng.next();
     const kind: VehicleKind = gate.gate!.industrial
       ? (roll < 0.72 ? 'semi' : 'pickup')
       : (roll < 0.52 ? 'sedan' : roll < 0.78 ? 'suv' : 'pickup');
@@ -268,7 +281,7 @@ export class Sim {
     if (first && first.s - first.len < VEHICLES[kind].len + S0 + 2) return;
     const route = this.router.findRoute(lane.id, goal, kind);
     if (!route) return;
-    const car = new Car(goal, this.time, kind);
+    const car = new Car(goal, this.time, kind, this.rng);
     car.pieces = route.map(r => ({ kind: r.kind, id: r.id }));
     car.s = 0.5;
     car.v = Math.min(lane.speed * 0.5, 8);
@@ -289,9 +302,9 @@ export class Sim {
     // periodic rerouting (only while on a lane)
     car.rerouteIn -= dt;
     if ((car.rerouteIn <= 0 || car.forceReroute) && cur.kind === 'lane') {
-      car.rerouteIn = REROUTE_EVERY * (0.7 + Math.random() * 0.6);
+      car.rerouteIn = REROUTE_EVERY * (0.7 + this.rng.next() * 0.6);
       const stuckLong = car.waitTime > 12;
-      if (car.forceReroute || stuckLong || Math.random() < 0.5) {
+      if (car.forceReroute || stuckLong || this.rng.next() < 0.5) {
         const route = this.router.findRoute(cur.id, car.goal, car.kind);
         if (route) {
           car.pieces = route.map(r => ({ kind: r.kind, id: r.id }));
@@ -499,7 +512,7 @@ export class Sim {
   /** discretionary lane change to get around slow traffic (semis etc.) */
   private considerOvertake(car: Car, leader: Obstacle) {
     if (car.lcCooldown > 0) return;
-    car.lcCooldown = 1.4 + Math.random() * 0.8;
+    car.lcCooldown = 1.4 + this.rng.next() * 0.8;
     const cur = car.cur()!;
     const lane = this.net.lane(cur.id);
     if (!lane) return;
@@ -552,7 +565,7 @@ export class Sim {
     const cur = car.cur()!;
     const conns = this.net.connsFrom(cur.id);
     if (!conns.length) { car.forceReroute = true; return; }
-    const pick = conns[Math.floor(Math.random() * conns.length)];
+    const pick = conns[Math.floor(this.rng.next() * conns.length)];
     const after = this.net.lane(pick.to);
     if (!after) return;
     const route = this.router.findRoute(pick.to, car.goal, car.kind);

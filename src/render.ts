@@ -57,18 +57,62 @@ const CAR_COLORS = [
   '#b08fc4', '#d98e32', '#5fa8a0', '#8a4f3d', '#e3c84f',
 ];
 
+export type RenderIdMode = 'nodes' | 'segments' | 'lanes' | 'all';
+
+export interface RenderDebugOptions {
+  grid?: boolean;
+  ids?: RenderIdMode | null;
+  selection?: SelectionRef | null;
+}
+
+export interface SelectionRef {
+  kind: 'node' | 'seg';
+  id: number;
+}
+
+interface RenderCanvas {
+  width: number;
+  height: number;
+  getContext(type: '2d'): CanvasRenderingContext2D | null;
+  getBoundingClientRect(): { width: number; height: number };
+}
+
+interface RenderOptions {
+  createCanvas?: (width: number, height: number) => RenderCanvas;
+  devicePixelRatio?: number;
+}
+
 export class Renderer {
-  private terrainCache: HTMLCanvasElement | null = null;
+  private terrainCache: RenderCanvas | null = null;
   private terrainCacheId = '';
+  private createCanvas: (width: number, height: number) => RenderCanvas;
+  private devicePixelRatio?: number;
 
   constructor(
-    private canvas: HTMLCanvasElement,
+    private canvas: RenderCanvas,
     private cam: Camera,
-  ) {}
+    opts: RenderOptions = {},
+  ) {
+    this.createCanvas = opts.createCanvas ?? ((width, height) => {
+      const cv = document.createElement('canvas');
+      cv.width = width;
+      cv.height = height;
+      return cv;
+    });
+    this.devicePixelRatio = opts.devicePixelRatio;
+  }
 
-  render(net: Network, sim: Sim, tools: Tools, map: TerrainMap, heatmap: boolean, time: number) {
+  render(
+    net: Network,
+    sim: Sim,
+    tools: Tools | null,
+    map: TerrainMap,
+    heatmap: boolean,
+    time: number,
+    debug: RenderDebugOptions = {},
+  ) {
     const ctx = this.canvas.getContext('2d')!;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = this.devicePixelRatio ?? (typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1);
     const rect = this.canvas.getBoundingClientRect();
     if (this.canvas.width !== Math.round(rect.width * dpr)) {
       this.canvas.width = Math.round(rect.width * dpr);
@@ -131,7 +175,10 @@ export class Renderer {
 
     for (const car of sim.cars) this.drawCar(ctx, car, time);
 
-    this.drawOverlays(ctx, net, tools, time);
+    if (debug.grid) this.drawDebugGrid(ctx);
+    if (tools) this.drawOverlays(ctx, net, tools, time);
+    if (debug.ids) this.drawDebugIds(ctx, net, debug.ids);
+    if (debug.selection) this.drawDebugSelection(ctx, net, debug.selection);
     this.drawWorldBorder(ctx);
   }
 
@@ -146,8 +193,7 @@ export class Renderer {
     if (!this.terrainCache || this.terrainCacheId !== map.id) {
       this.terrainCacheId = map.id;
       const sc = 3;
-      const cv = document.createElement('canvas');
-      cv.width = WORLD_W * sc; cv.height = WORLD_H * sc;
+      const cv = this.createCanvas(WORLD_W * sc, WORLD_H * sc);
       const c = cv.getContext('2d')!;
       c.scale(sc, sc);
       c.fillStyle = COL.grass;
@@ -187,7 +233,7 @@ export class Renderer {
       }
       this.terrainCache = cv;
     }
-    ctx.drawImage(this.terrainCache, 0, 0, WORLD_W, WORLD_H);
+    ctx.drawImage(this.terrainCache as unknown as CanvasImageSource, 0, 0, WORLD_W, WORLD_H);
   }
 
   private drawWorldBorder(ctx: CanvasRenderingContext2D) {
@@ -923,6 +969,76 @@ export class Renderer {
       const g = Math.round(200 - 150 * t);
       this.strokePoly(ctx, lane.poly.pts, 2.2, `rgba(${r},${g},60,${0.25 + 0.45 * t})`);
     }
+  }
+
+  private drawDebugGrid(ctx: CanvasRenderingContext2D) {
+    const view = this.viewBounds();
+    ctx.save();
+    ctx.strokeStyle = 'rgba(246,201,69,.22)';
+    ctx.lineWidth = 0.12;
+    ctx.setLineDash([1, 3]);
+    const x0 = Math.max(0, Math.floor(view.x0 / 16) * 16);
+    const y0 = Math.max(0, Math.floor(view.y0 / 16) * 16);
+    for (let x = x0; x <= Math.min(WORLD_W, view.x1); x += 16) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, WORLD_H);
+      ctx.stroke();
+    }
+    for (let y = y0; y <= Math.min(WORLD_H, view.y1); y += 16) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(WORLD_W, y);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  private drawDebugIds(ctx: CanvasRenderingContext2D, net: Network, mode: RenderIdMode) {
+    ctx.save();
+    ctx.font = '5px Overpass Mono, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 0.9;
+    const label = (text: string, p: V, color: string) => {
+      ctx.strokeStyle = 'rgba(16,18,22,.85)';
+      ctx.fillStyle = color;
+      ctx.strokeText(text, p.x, p.y);
+      ctx.fillText(text, p.x, p.y);
+    };
+
+    if (mode === 'nodes' || mode === 'all') {
+      for (const node of net.nodes.values()) label(`n${node.id}`, node.pos, '#ffe07a');
+    }
+    if (mode === 'segments' || mode === 'all') {
+      for (const seg of net.segs.values()) label(`s${seg.id}`, polyPoint(seg.poly, seg.poly.len / 2), '#dceeff');
+    }
+    if (mode === 'lanes' || mode === 'all') {
+      for (const lane of net.lanesById.values()) label(lane.id, polyPoint(lane.poly, lane.poly.len / 2), '#b6f7c4');
+    }
+    ctx.restore();
+  }
+
+  private drawDebugSelection(ctx: CanvasRenderingContext2D, net: Network, selection: SelectionRef) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,232,112,.95)';
+    ctx.fillStyle = 'rgba(255,232,112,.18)';
+    if (selection.kind === 'node') {
+      const node = net.nodes.get(selection.id);
+      if (node) {
+        const r = Math.max(node.junctionR, 4.5) + 2;
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        ctx.arc(node.pos.x, node.pos.y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    } else {
+      const seg = net.segs.get(selection.id);
+      if (seg) this.strokePoly(ctx, seg.poly.pts, seg.rt.halfWidth * 2 + 2.4, 'rgba(255,232,112,.34)');
+    }
+    ctx.restore();
   }
 
   private drawOverlays(ctx: CanvasRenderingContext2D, net: Network, tools: Tools, time: number) {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "GRIDLOCK Level Tools"
+  short_description: "Build and render GRIDLOCK levels"
+  default_prompt: "Use $gridlock-level-tools to create a GRIDLOCK level scene and render exact debug screenshots."

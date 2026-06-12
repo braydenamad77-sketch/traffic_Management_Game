@@ -21,6 +21,13 @@
         </div>
       </div>
 
+      <div class="topgroup" id="level-group">
+        <span class="grouplabel">Level</span>
+        <select id="level-select" title="Campaign level">
+          <option value="custom">Custom Sandbox</option>
+        </select>
+      </div>
+
       <div class="topgroup" id="map-group">
         <span class="grouplabel">District</span>
         <select id="map-select" title="Terrain map">
@@ -73,6 +80,18 @@
         <div class="hintline" id="hint">Select a tool</div>
       </div>
     </aside>
+
+    <section id="objective-card" hidden>
+      <div class="objective-meta">
+        <span class="objective-kicker" id="objective-kicker">Campaign</span>
+        <span class="objective-title" id="objective-title">Objective</span>
+        <span class="objective-subtitle" id="objective-subtitle"></span>
+      </div>
+      <div class="objective-progress">
+        <span id="objective-arrivals">Arrived 0 / 0</span>
+        <span id="objective-status">Running</span>
+      </div>
+    </section>
 
     <aside id="panel" hidden>
       <div id="panel-content"></div>

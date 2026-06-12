@@ -1,12 +1,16 @@
 import { V, clamp } from './vec';
 import { WORLD_W, WORLD_H } from './terrain';
 
+export interface CameraCanvas {
+  getBoundingClientRect(): { width: number; height: number };
+}
+
 export class Camera {
   x = WORLD_W / 2;
   y = WORLD_H / 2;
   zoom = 2.2;        // px per world unit
 
-  constructor(public canvas: HTMLCanvasElement) {}
+  constructor(public canvas: CameraCanvas) {}
 
   toWorld(sx: number, sy: number): V {
     const r = this.canvas.getBoundingClientRect();
